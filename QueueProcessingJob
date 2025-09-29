@@ -1,0 +1,288 @@
+My code - 
+
+QueueProcessingJob - 
+package com.vonage.resischeduler.job;
+
+import com.vonage.resischeduler.config.job.JobDefinition;
+import com.vonage.resischeduler.entity.job.JobInstance;
+import com.vonage.resischeduler.entity.job.QueueRecord;
+import com.vonage.resischeduler.enums.JobInstanceStatus;
+import com.vonage.resischeduler.enums.QueueStatus;
+import com.vonage.resischeduler.repository.job.JobInstanceRepository;
+import com.vonage.resischeduler.repository.job.QueueRecordRepository;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.TaskScheduler;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+/**
+ * Framework JobType for queue-based jobs. Business jobs should extend this abstract class and
+ * implement the protected hook methods below.
+ */
+@Slf4j
+public abstract class QueueProcessingJob {
+
+  /**
+   * keep track of scheduled workers, so we can cancel them once job
+   * completed. key = jobInstanceId.
+   */
+  private final ConcurrentHashMap<Long, ScheduledFuture<?>> scheduledWorkers =
+      new ConcurrentHashMap<>();
+
+  @Autowired
+  protected JobInstanceRepository jobInstanceRepository;
+  @Autowired
+  protected QueueRecordRepository queueRecordRepository;
+  @Autowired
+  protected TaskScheduler taskScheduler;
+
+  /**
+   * Public entry point invoked by ConfigJobScheduler at cron tick.
+   */
+  public JobInstance startJob(final JobDefinition jobDefinition) {
+    Map<String, Object> metadata = getJobMetadata(jobDefinition);
+
+    JobInstance jobInstance = createJobInstance(jobDefinition, metadata);
+
+    initializeJobInstance(jobInstance, jobDefinition);
+
+    return jobInstance;
+  }
+
+  /**
+   * Persist a new job instance in PENDING state.
+   */
+  private JobInstance createJobInstance(
+      final JobDefinition jobDefinition, final Map<String, Object> metadata) {
+    return jobInstanceRepository.save(
+        JobInstance.builder()
+            .notificationType(jobDefinition.getType())
+            .status(JobInstanceStatus.PENDING)
+            .contextData(metadata)
+            .cronSchedule(jobDefinition.getCron())
+            .isWorkerPeriodic(jobDefinition.getInstance().isOneTime())
+            .repeatIntervalSeconds(jobDefinition.getInstance().getRepeatIntervalSeconds())
+            .build());
+  }
+
+  private void initializeJobInstance(
+      final JobInstance jobInstance, final JobDefinition jobDefinition) {
+    log.info(
+        "Initializing job instance {} for type: {}", jobInstance.getId(), jobDefinition.getType());
+
+    enrichJobMetadata(jobInstance);
+
+    List<QueueRecord> initialRecords = fetchEligibleRecords(jobInstance.getContextData());
+
+    persistQueueRecords(jobInstance, initialRecords);
+
+    transitionToInProgress(jobInstance);
+
+    // schedule worker after commit so the worker sees persisted job_instance and queue rows
+    TransactionSynchronizationManager.registerSynchronization(
+        new TransactionSynchronization() {
+          @Override
+          public void afterCommit() {
+            scheduleWorkerAfterCommit(jobInstance, jobDefinition);
+          }
+        });
+  }
+
+  private void scheduleWorkerAfterCommit(JobInstance jobInstance, JobDefinition jobDefinition) {
+    int repeatSec =
+        jobInstance.getRepeatIntervalSeconds() == null ? 0 : jobInstance.getRepeatIntervalSeconds();
+
+    if (Boolean.FALSE.equals(jobDefinition.getInstance().isOneTime()) && repeatSec > 0) {
+      schedulePeriodicWorker(jobInstance.getId(), jobDefinition, repeatSec);
+    } else if (Boolean.TRUE.equals(jobDefinition.getInstance().isOneTime())) {
+      scheduleOneTimeWorker(jobInstance.getId(), jobDefinition);
+    } else {
+      scheduleOneTimeWorker(jobInstance.getId(), jobDefinition);
+    }
+  }
+
+  private void schedulePeriodicWorker(
+      Long jobInstanceId, JobDefinition jobDefinition, int repeatSeconds) {
+    if (scheduledWorkers.containsKey(jobInstanceId)) {
+      log.debug("Worker already scheduled for jobInstance {}", jobInstanceId);
+      return;
+    }
+    QueueWorker worker = new QueueWorker(jobInstanceId, jobDefinition, this, jobInstanceRepository);
+    Duration period = Duration.ofSeconds(repeatSeconds);
+    ScheduledFuture<?> future = taskScheduler.scheduleAtFixedRate(worker, period);
+    scheduledWorkers.put(jobInstanceId, future);
+    log.info(
+        "Scheduled periodic worker for jobInstance {} every {}s", jobInstanceId, repeatSeconds);
+  }
+
+  private void scheduleOneTimeWorker(Long jobInstanceId, JobDefinition jobDefinition) {
+    if (scheduledWorkers.containsKey(jobInstanceId)) {
+      log.debug("Worker already scheduled for jobInstance {}", jobInstanceId);
+      return;
+    }
+    QueueWorker worker = new QueueWorker(jobInstanceId, jobDefinition, this, jobInstanceRepository);
+    // schedule immediate run
+    ScheduledFuture<?> future = taskScheduler.schedule(worker, Instant.now());
+    scheduledWorkers.put(jobInstanceId, future);
+    log.info("Scheduled one-time worker for jobInstance {}", jobInstanceId);
+  }
+
+  /**
+   * Worker cancellation helper used by the worker when job becomes terminal.
+   */
+  public void cancelWorker(Long jobInstanceId) {
+    ScheduledFuture<?> f = scheduledWorkers.remove(jobInstanceId);
+    if (f != null) {
+      f.cancel(false);
+      log.info("Cancelled worker for jobInstance {}", jobInstanceId);
+    }
+  }
+
+  /**
+   * Called by QueueWorker each run. The worker passes the jobInstanceId and jobDefinition.
+   */
+  public void processJobInstance(final Long jobInstanceId, final JobDefinition jobDefinition) {
+    JobInstance jobInstance = jobInstanceRepository.findById(jobInstanceId).orElse(null);
+    if (jobInstance == null) {
+      log.warn("JobInstance {} not found. Cancelling worker.", jobInstanceId);
+      cancelWorker(jobInstanceId);
+      return;
+    }
+
+    JobInstanceStatus status = jobInstance.getStatus();
+
+    if (status == JobInstanceStatus.IN_PROGRESS) {
+      log.debug("Processing IN_PROGRESS jobInstance {}", jobInstanceId);
+
+      List<QueueRecord> pendingRecords =
+          fetchPendingQueueRecords(jobInstance.getId(), jobDefinition.getInstance().getBatchSize());
+
+      if (!pendingRecords.isEmpty()) {
+        processQueueBatch(pendingRecords);
+      } else {
+        completeJobInstance(jobInstance);
+        cancelWorker(jobInstanceId);
+      }
+    } else if (status == JobInstanceStatus.PENDING) {
+      log.debug(
+          "Worker ran for jobInstance {} in PENDING state. Worker will not initialize; "
+              + "expected IN_PROGRESS.",
+          jobInstanceId);
+    } else {
+      // COMPLETED or FAILED -> cancel worker
+      log.debug("JobInstance {} in terminal state {}. Cancelling worker.", jobInstanceId, status);
+      cancelWorker(jobInstanceId);
+    }
+  }
+
+  private void persistQueueRecords(final JobInstance jobInstance, final List<QueueRecord> records) {
+    if (records == null || records.isEmpty()) {
+      log.info("No eligible records found for jobInstance {}", jobInstance.getId());
+      return;
+    }
+    for (QueueRecord r : records) {
+      r.setJobInstanceId(jobInstance.getId());
+      r.setStatus(QueueStatus.PENDING);
+    }
+    queueRecordRepository.saveAll(records);
+    log.info("Saved {} records to queue for job instance: {}", records.size(), jobInstance.getId());
+  }
+
+  private List<QueueRecord> fetchPendingQueueRecords(
+      final Long jobInstanceId, final int batchSize) {
+    PageRequest pageable = PageRequest.of(0, Math.max(1, batchSize));
+    return queueRecordRepository.findByJobInstanceIdAndStatus(
+        jobInstanceId, QueueStatus.PENDING, pageable);
+  }
+
+  /**
+   * Process a batch of queue records.
+   */
+  private void processQueueBatch(final List<QueueRecord> batch) {
+    for (QueueRecord record : batch) {
+      try {
+        processRecord(record);
+        markQueueRecordAsSuccess(record);
+      } catch (Exception e) {
+        log.error("Error processing record {}: {}", record.getId(), e.getMessage(), e);
+        retryOrFailQueueRecord(record, e.getMessage());
+      }
+    }
+  }
+
+  private void transitionToInProgress(final JobInstance jobInstance) {
+    jobInstance.setStatus(JobInstanceStatus.IN_PROGRESS);
+    jobInstanceRepository.save(jobInstance);
+    log.info("Job instance {} transitioned to IN_PROGRESS", jobInstance.getId());
+  }
+
+  private void completeJobInstance(final JobInstance jobInstance) {
+    jobInstance.setStatus(JobInstanceStatus.COMPLETED);
+    jobInstanceRepository.save(jobInstance);
+    log.info("Job instance {} marked as COMPLETED", jobInstance.getId());
+  }
+
+  private void markQueueRecordAsSuccess(final QueueRecord record) {
+    record.setStatus(QueueStatus.SUCCESS);
+    record.setFailureReason(null);
+    record.setLastAttemptedAt(LocalDateTime.now());
+    queueRecordRepository.save(record);
+    log.debug("Record {} marked as SUCCESS", record.getId());
+  }
+
+  private void retryOrFailQueueRecord(final QueueRecord record, final String failureReason) {
+    record.setRetryCount(record.getRetryCount() + 1);
+    record.setFailureReason(failureReason);
+    record.setLastAttemptedAt(LocalDateTime.now());
+
+    if (record.getRetryCount() >= getMaxRetries()) {
+      record.setStatus(QueueStatus.FAILED);
+      log.warn(
+          "Record {} marked as FAILED after {} retries", record.getId(), record.getRetryCount());
+    } else {
+      record.setStatus(QueueStatus.PENDING);
+      log.info(
+          "Record {} will be retried. Retry count: {}", record.getId(), record.getRetryCount());
+    }
+
+    queueRecordRepository.save(record);
+  }
+
+  /* --------------------
+  Abstract hooks to be implemented by implementation Classes.
+  -------------------- */
+
+  /**
+   * Business implementation for processing a single queue record (domain logic).
+   */
+  protected abstract void processRecord(QueueRecord queueRecord);
+
+  /**
+   * Business implementation to enrich job instance context (optional).
+   */
+  protected abstract void enrichJobMetadata(JobInstance jobInstance);
+
+  /**
+   * Business implementation that returns initial queue records from domain data.
+   */
+  protected abstract List<QueueRecord> fetchEligibleRecords(Map<String, Object> metadata);
+
+  /**
+   * Maximum retries for records (business-configurable).
+   */
+  protected abstract Integer getMaxRetries();
+
+  /**
+   * Build the metadata/context for the job instance from JobDefinition.
+   */
+  protected abstract Map<String, Object> getJobMetadata(JobDefinition jobDefinition);
+}
