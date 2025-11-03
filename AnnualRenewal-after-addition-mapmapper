@@ -1,0 +1,348 @@
+package com.vonage.resischeduler.jobs.annualrenewal;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.vonage.resischeduler.framework.config.job.JobConfig;
+import com.vonage.resischeduler.framework.jobtype.base.PeriodicQueueProcessingJobType;
+import com.vonage.resischeduler.framework.jobtype.dto.QueueRecordContextDto;
+import com.vonage.resischeduler.framework.jobtype.dto.QueueRecordPayloadDto;
+import com.vonage.resischeduler.framework.jobtype.enums.JobInstanceStatus;
+import com.vonage.resischeduler.framework.jobtype.enums.QueueStatus;
+import com.vonage.resischeduler.framework.persistence.entity.JobInstance;
+import com.vonage.resischeduler.framework.persistence.entity.QueueRecord;
+import com.vonage.resischeduler.framework.persistence.repository.JobInstanceRepository;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.AnnualRenewalContextDataDto;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.AnnualRenewalPlaceholderDto;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.AnnualRenewalQueueRecordDto;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.EmailPlaceholderDto;
+import com.vonage.resischeduler.jobs.annualrenewal.mapper.AnnualRenewalDtoMapper;
+import com.vonage.resischeduler.shared.billing.entity.RatePromoEntity;
+import com.vonage.resischeduler.shared.billing.repository.RatePromoRepository;
+import com.vonage.resischeduler.shared.client.email.UnifiedServicesClient;
+import com.vonage.resischeduler.shared.client.email.exception.EmailPlaceholderDataNotFoundException;
+import com.vonage.resischeduler.shared.uad.repository.SaveTerminateTaskRepository;
+import com.vonage.resischeduler.shared.vdv.entity.AccountEntity;
+import com.vonage.resischeduler.shared.vdv.entity.AccountUserEntity;
+import com.vonage.resischeduler.shared.vdv.entity.DidBillingItemEntity;
+import com.vonage.resischeduler.shared.vdv.entity.DidNumberEntity;
+import com.vonage.resischeduler.shared.vdv.repository.AccountRepository;
+import com.vonage.resischeduler.shared.vdv.repository.AccountUserRepository;
+import com.vonage.resischeduler.shared.vdv.repository.DidBillingItemRepository;
+import com.vonage.resischeduler.shared.vdv.repository.DidNumberRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Handles annual renewal reminder notifications.
+ * Integrates legacy renewal service into the new job framework.
+ */
+@Slf4j
+@Component
+public class AnnualRenewal extends PeriodicQueueProcessingJobType<AnnualRenewalContextDataDto> {
+
+  private static final List<String> DISCONNECT_TASK_STATUS_CODES = List.of("FDPES", "FDP");
+  private static final String DISCONNECT_TASK_TYPE_CODE = "ACCT";
+  private static final int MONTHS_IN_YEAR = 12;
+
+  private final RatePromoRepository ratePromoRepository;
+  private final DidBillingItemRepository didBillingItemRepository;
+  private final SaveTerminateTaskRepository saveTerminateTaskRepository;
+  private final AccountRepository accountRepository;
+  private final AccountUserRepository accountUserRepository;
+  private final DidNumberRepository didNumberRepository;
+  private final JobInstanceRepository jobInstanceRepository;
+  private final UnifiedServicesClient unifiedServicesClient;
+  private final AnnualRenewalDtoMapper annualRenewalDtoMapper;
+  private final ObjectMapper objectMapper;
+
+  public AnnualRenewal(
+      JobInstanceRepository jobInstanceRepository,
+      RatePromoRepository ratePromoRepository,
+      DidBillingItemRepository didBillingItemRepository,
+      SaveTerminateTaskRepository saveTerminateTaskRepository,
+      AccountRepository accountRepository,
+      AccountUserRepository accountUserRepository,
+      DidNumberRepository didNumberRepository,
+      ObjectMapper objectMapper,
+      UnifiedServicesClient unifiedServicesClient,
+      AnnualRenewalDtoMapper annualRenewalDtoMapper) {
+
+    this.jobInstanceRepository = jobInstanceRepository;
+    this.ratePromoRepository = ratePromoRepository;
+    this.didBillingItemRepository = didBillingItemRepository;
+    this.saveTerminateTaskRepository = saveTerminateTaskRepository;
+    this.accountRepository = accountRepository;
+    this.accountUserRepository = accountUserRepository;
+    this.didNumberRepository = didNumberRepository;
+    this.unifiedServicesClient = unifiedServicesClient;
+    this.annualRenewalDtoMapper = annualRenewalDtoMapper;
+    this.objectMapper = objectMapper;
+  }
+
+  /** Load context data DTO */
+  @Override
+  protected AnnualRenewalContextDataDto getJobContextData(JobConfig jobConfig) {
+    AnnualRenewalContextDataDto dto =
+        objectMapper.convertValue(jobConfig.getContextData(), AnnualRenewalContextDataDto.class);
+    log.info("Loaded job metadata: {}", dto);
+    return dto;
+  }
+
+  @Override
+  protected Class<AnnualRenewalContextDataDto> getJobContextDataDtoType() {
+    return AnnualRenewalContextDataDto.class;
+  }
+
+  /** Enrich context with calculated date range */
+  @Override
+  protected void enrichJobContextData(AnnualRenewalContextDataDto jobMetadata) {
+    Optional<JobInstance> lastJobOpt =
+        jobInstanceRepository.findTopByJobNameOrderByCreateDateDesc("ANNUAL_RENEWAL");
+
+    LocalDateTime lastJobCreatedAt = lastJobOpt.map(JobInstance::getCreateDate).orElse(null);
+    LocalDate renCalStartDate = getNextEligibleJobDate(jobMetadata, lastJobCreatedAt);
+    LocalDate today = LocalDate.now();
+
+    if (renCalStartDate.isAfter(today)) {
+      renCalStartDate = today;
+    }
+
+    jobMetadata.setRenewalCalStartDate(renCalStartDate);
+    jobMetadata.setRenewalCalEndDate(today);
+
+    log.info("Enriched job metadata. Processing renewals from {} to {}", renCalStartDate, today);
+  }
+
+  private LocalDate getNextEligibleJobDate(
+      AnnualRenewalContextDataDto jobMetadataDto, LocalDateTime lastJobCreatedAt) {
+    LocalDate today = LocalDate.now();
+    LocalDate cutoffDate = today.minusDays(jobMetadataDto.getLookbackDays());
+
+    if (lastJobCreatedAt == null) {
+      return today;
+    }
+
+    LocalDate lastJobDate = lastJobCreatedAt.toLocalDate();
+    return lastJobDate.isBefore(cutoffDate) ? cutoffDate : lastJobDate.plusDays(1);
+  }
+
+  /** Fetch eligible billing items for renewal notifications */
+  @Override
+  protected List<QueueRecordPayloadDto> fetchEligibleRecords(
+      AnnualRenewalContextDataDto jobMetadata) {
+
+    log.info("Fetching eligible renewals between {} and {}.",
+        jobMetadata.getRenewalCalStartDate(), jobMetadata.getRenewalCalEndDate());
+
+    List<String> eligibleItemCodes = getEligibleAnnualPlanItemCodes();
+    if (eligibleItemCodes.isEmpty()) {
+      log.info("No eligible annual item codes found. Skipping record fetching.");
+      return Collections.emptyList();
+    }
+
+    List<DidBillingItemEntity> billingItems =
+        fetchBillingItemsForDateRange(
+            jobMetadata.getRenewalCalStartDate(),
+            jobMetadata.getRenewalCalEndDate(),
+            eligibleItemCodes,
+            jobMetadata.getNotifDays());
+
+    log.info("Found {} potentially eligible billing items for notification.",
+        billingItems.size());
+
+    return buildEligibleQueueRecordEntries(billingItems, jobMetadata.getRenewalCalEndDate());
+  }
+
+  /** Cleanly build queue records using mapper & DTO */
+  private List<QueueRecordPayloadDto> buildEligibleQueueRecordEntries(
+      List<DidBillingItemEntity> billingItems, LocalDate processingDate) {
+
+    return billingItems.stream()
+        .filter(item -> !(hasDidBillingPlanEndedBeforeRenewalDate(item.getDateEnd(), processingDate)
+            || isScheduledForFutureDisconnect(item.getAccountNumber())))
+        .map(item -> {
+          AnnualRenewalQueueRecordDto dto = buildQueueRecordDto(item, processingDate);
+          QueueRecordPayloadDto record = new QueueRecordPayloadDto();
+          record.setContextData(annualRenewalDtoMapper.mapRenewalQueueRecordDtoToContextDataMap(dto));
+          return record;
+        })
+        .collect(Collectors.toList());
+  }
+
+  /** Create strongly typed DTO instead of map building */
+  private AnnualRenewalQueueRecordDto buildQueueRecordDto(
+      DidBillingItemEntity item, LocalDate processingDate) {
+
+    LocalDate renewalDate = item.getDateStart().plusMonths(MONTHS_IN_YEAR);
+    int daysToRenewal = (int) ChronoUnit.DAYS.between(processingDate, renewalDate);
+
+    return AnnualRenewalQueueRecordDto.builder()
+        .accountNumber(item.getAccountNumber())
+        .didNumberId(item.getDidNumberId())
+        .itemCode(item.getServiceItemCode())
+        .didBillingSeqId(item.getSequenceId())
+        .renewalPeriodDays(daysToRenewal)
+        .renewalDate(renewalDate.atStartOfDay())
+        .businessIdentifier(UUID.randomUUID())
+        .build();
+  }
+
+  /** Recovery logic for unfinished jobs */
+  @Override
+  public void onJobInstanceRecovery(JobConfig jobConfig, JobInstance jobInstance) {
+    log.info("Recovering JobInstance [{}] for AnnualRenewal...", jobInstance.getId());
+
+    AnnualRenewalContextDataDto jobMetadata =
+        objectMapper.convertValue(jobConfig.getContextData(), AnnualRenewalContextDataDto.class);
+
+    int lookbackDays = jobMetadata.getLookbackDays();
+    LocalDate today = LocalDate.now();
+    LocalDate lookbackCutoffDate = today.minusDays(lookbackDays);
+    LocalDate jobInstanceCreateDate = jobInstance.getCreateDate().toLocalDate();
+
+    if (jobInstanceCreateDate.isBefore(lookbackCutoffDate)) {
+      log.info(
+          "JobInstance [{}] created on [{}] is older than lookback window cutoff [{}]. " +
+              "Marking all queue records as SKIPPED and instance as SUCCESS.",
+          jobInstance.getId(), jobInstanceCreateDate, lookbackCutoffDate);
+
+      List<QueueRecord> queueRecords =
+          queueRecordRepository.findByJobInstanceId(jobInstance.getId());
+
+      queueRecords.forEach(record -> record.setStatus(QueueStatus.SKIPPED));
+      queueRecordRepository.saveAll(queueRecords);
+
+      jobInstance.setStatus(JobInstanceStatus.SUCCESS);
+      jobInstanceRepository.save(jobInstance);
+
+      log.info("JobInstance [{}] marked as SUCCESS (skipped recovery).", jobInstance.getId());
+    } else {
+      log.info(
+          "JobInstance [{}] created on [{}] is within valid lookback window (cutoff {}). " +
+              "No action taken; normal execution will resume.",
+          jobInstance.getId(), jobInstanceCreateDate, lookbackCutoffDate);
+    }
+  }
+
+  /** Process each queue record safely using DTO mapping */
+  @Override
+  protected Map<String, Object> processQueueRecord(QueueRecordContextDto context) {
+    AnnualRenewalQueueRecordDto renewalQueueRecordDto =
+        annualRenewalDtoMapper.mapContextDataMapToRenewalQueueRecordDto(context.getContextData());
+
+    log.debug("Processing queue record ID {} for account {} and businessIdentifier {}",
+        context.getId(), renewalQueueRecordDto.getAccountNumber(), renewalQueueRecordDto.getBusinessIdentifier());
+
+    Map<String, Object> resultMap = new HashMap<>();
+
+    try {
+      AnnualRenewalPlaceholderDto emailData = fetchPreparedEmailPlaceholderData(renewalQueueRecordDto);
+      Long emailQueueId = unifiedServicesClient.sendAnnualRenewalReminderEmail(emailData);
+      log.info("Successfully dispatched renewal email for account {}. EmailData: {}",
+          renewalQueueRecordDto.getAccountNumber(), emailData);
+
+      resultMap.put("emailQueueId", emailQueueId);
+      return resultMap;
+
+    } catch (Exception ex) {
+      log.error("Error processing queue record for account {}: {}",
+          renewalQueueRecordDto.getAccountNumber(), ex.getMessage(), ex);
+      throw new RuntimeException(
+          "Failed to process renewal email for account " + renewalQueueRecordDto.getAccountNumber(), ex);
+    }
+  }
+
+  /** Builds the email placeholder DTO cleanly using the typed metadata */
+  private AnnualRenewalPlaceholderDto fetchPreparedEmailPlaceholderData(AnnualRenewalQueueRecordDto renewalQueueRecordDto) {
+    Long accountNumber = renewalQueueRecordDto.getAccountNumber();
+    Long didNumberId = renewalQueueRecordDto.getDidNumberId();
+    String itemCode = renewalQueueRecordDto.getItemCode();
+    LocalDateTime renewalDate = renewalQueueRecordDto.getRenewalDate();
+
+    AccountUserEntity accountUser = getAccountUserData(accountNumber);
+    String phone = getPhoneNumber(didNumberId);
+    BigDecimal renewalAmount = getPlanPrice(itemCode);
+    String partnerId = getPartnerId(accountNumber);
+
+    return AnnualRenewalPlaceholderDto.builder()
+        .accountUser(accountUser)
+        .phoneNumber(phone)
+        .renewalDate(renewalDate)
+        .renewalAmount(renewalAmount)
+        .partnerId(partnerId)
+        .accountNumber(accountNumber)
+        .build();
+  }
+
+  // ===== Helper methods below (unchanged but cleaned up) ===== //
+
+  private List<String> getEligibleAnnualPlanItemCodes() {
+    return ratePromoRepository.findEligibleAnnualPlans().stream()
+        .map(RatePromoEntity::getItemCode)
+        .collect(Collectors.toList());
+  }
+
+  private List<DidBillingItemEntity> fetchBillingItemsForDateRange(
+      LocalDate startDate, LocalDate endDate,
+      List<String> eligibleItemCodes, List<Integer> renewalPeriods) {
+
+    List<DidBillingItemEntity> allItems = new ArrayList<>();
+    LocalDate currentDate = startDate;
+
+    while (!currentDate.isAfter(endDate)) {
+      allItems.addAll(didBillingItemRepository.findByItemCodeInAndRenewalDateWithinReminderPeriod(
+          eligibleItemCodes, renewalPeriods, currentDate));
+      currentDate = currentDate.plusDays(1);
+    }
+    return allItems;
+  }
+
+  private boolean isScheduledForFutureDisconnect(Long accountNumber) {
+    return !saveTerminateTaskRepository
+        .findByAcctNbrAndTaskStatusCdInAndTaskTypeCd(
+            accountNumber, DISCONNECT_TASK_STATUS_CODES, DISCONNECT_TASK_TYPE_CODE)
+        .isEmpty();
+  }
+
+  private boolean hasDidBillingPlanEndedBeforeRenewalDate(
+      LocalDate accountEndDate, LocalDate processingDate) {
+    return accountEndDate != null && !accountEndDate.isAfter(processingDate);
+  }
+
+  private AccountUserEntity getAccountUserData(Long accountNumber) {
+    return accountUserRepository.findUserNameAndEmailAddressByAccountNumber(accountNumber)
+        .orElseThrow(() ->
+            new EmailPlaceholderDataNotFoundException(
+                "User data not found for account: " + accountNumber));
+  }
+
+  private String getPhoneNumber(Long didNumberId) {
+    return didNumberRepository.findPhoneNumberByDidNumberId(didNumberId)
+        .map(DidNumberEntity::getPhoneNumber)
+        .orElseThrow(() ->
+            new EmailPlaceholderDataNotFoundException(
+                "Phone number not found for DID ID: " + didNumberId));
+  }
+
+  private BigDecimal getPlanPrice(String itemCode) {
+    return ratePromoRepository.findPlanPriceByItemCode(itemCode)
+        .map(RatePromoEntity::getPrice)
+        .orElseThrow(() ->
+            new EmailPlaceholderDataNotFoundException(
+                "Plan price not found for item code: " + itemCode));
+  }
+
+  private String getPartnerId(Long accountNumber) {
+    return accountRepository.findPartnerIdByAccountNumber(accountNumber)
+        .map(AccountEntity::getPartnerId)
+        .orElseThrow(() ->
+            new EmailPlaceholderDataNotFoundException(
+                "Partner ID not found for account: " + accountNumber));
+  }
+}
