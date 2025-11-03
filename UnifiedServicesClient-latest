@@ -1,0 +1,215 @@
+package com.vonage.resischeduler.shared.client.email;
+
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.email.AnnualRenewalEmailPayloadDto;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.email.AnnualRenewalPlaceholderDto;
+import com.vonage.resischeduler.shared.client.email.constant.EmailConstants;
+import com.vonage.resischeduler.shared.client.email.dto.EmailApiRequestDto;
+import com.vonage.resischeduler.shared.client.email.dto.EmailApiResponseDto;
+import com.vonage.resischeduler.shared.client.email.dto.EmailEntryData;
+import com.vonage.resischeduler.shared.client.email.exception.EmailApiException;
+import com.vonage.resischeduler.shared.client.email.util.PiSignature;
+import java.io.StringWriter;
+import java.net.URI;
+import java.text.DecimalFormat;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClient;
+
+/**
+ * Client for interacting with the Unified Services Email API.
+ */
+@Component
+@Slf4j
+public class UnifiedServicesClient {
+
+  private static final DateTimeFormatter RENEWAL_DATE_FORMATTER =
+      DateTimeFormatter.ofPattern(EmailConstants.DATE_FORMAT_MONTH_DAY_YEAR);
+  private static final DecimalFormat AMOUNT_FORMATTER = new DecimalFormat("0.00");
+
+  private final RestClient restClient;
+  private final ObjectMapper jsonMapper;
+  private final XmlMapper xmlMapper;
+
+  private final String emailApiBaseUrl;
+  private final String emailApiEndpoint;
+  private final String apiCreateUser;
+  private final String apiCreateProgram;
+  private final String defaultVgMailingName;
+  private final String emailApiKey;
+  private final String hmacSecretKey;
+
+  /**
+   * Constructs a new UnifiedServicesClient with required configuration and dependencies.
+   */
+  public UnifiedServicesClient(
+      RestClient.Builder restClientBuilder,
+      @Value("${annual-renewal-notification.email-api.base-url}") String emailApiBaseUrl,
+      @Value("${annual-renewal-notification.email-api.endpoint}") String emailApiEndpoint,
+      @Value("${annual-renewal-notification.email-api.create-user}") String apiCreateUser,
+      @Value("${annual-renewal-notification.email-api.create-program}") String apiCreateProgram,
+      @Value("${annual-renewal-notification.email-api.vg-mailing-name}")
+      String defaultVgMailingName,
+      @Value("${annual-renewal-notification.email-api.key}") String emailApiKey,
+      @Value("${annual-renewal-notification.email-api.secret}") String hmacSecretKey) {
+
+    this.restClient = restClientBuilder.build();
+    this.jsonMapper = new ObjectMapper();
+    this.xmlMapper = new XmlMapper();
+    this.emailApiBaseUrl = emailApiBaseUrl;
+    this.emailApiEndpoint = emailApiEndpoint;
+    this.apiCreateUser = apiCreateUser;
+    this.apiCreateProgram = apiCreateProgram;
+    this.defaultVgMailingName = defaultVgMailingName;
+    this.emailApiKey = emailApiKey;
+    this.hmacSecretKey = hmacSecretKey;
+  }
+
+  /**
+   * Sends an annual renewal reminder email using the configured Email API.
+   */
+  public Long sendAnnualRenewalReminderEmail(AnnualRenewalPlaceholderDto emailPlaceholderDto) {
+    try {
+      String requestBody = serializeEmailApiRequestToJson(emailPlaceholderDto);
+      EmailApiResponseDto apiResponse = makeEmailApiRequest(requestBody);
+      return extractQueueIdFromApiResponse(apiResponse);
+    } catch (Exception e) {
+      throw new EmailApiException("Error sending annual renewal email", e);
+    }
+  }
+
+  private String serializeEmailApiRequestToJson(AnnualRenewalPlaceholderDto emailPlaceholderDto)
+      throws Exception {
+    AnnualRenewalEmailPayloadDto contentData =
+        mapEmailPlaceholderDtoToEmailPlaceholderContentDto(emailPlaceholderDto);
+    String xmlContent = serializeEmailContentToXml(contentData);
+    EmailApiRequestDto apiRequest =
+        mapEmailPlaceholderToEmailApiRequest(emailPlaceholderDto, xmlContent);
+
+    return jsonMapper.writeValueAsString(apiRequest);
+  }
+
+  private AnnualRenewalEmailPayloadDto mapEmailPlaceholderDtoToEmailPlaceholderContentDto(
+      AnnualRenewalPlaceholderDto emailPlaceholderDto) {
+    String formattedRenewalDate =
+        emailPlaceholderDto.getRenewalDate().toLocalDate().format(RENEWAL_DATE_FORMATTER);
+    String formattedRenewalAmount =
+        AMOUNT_FORMATTER.format(emailPlaceholderDto.getRenewalAmount());
+    return AnnualRenewalEmailPayloadDto.builder()
+        .customer(
+            AnnualRenewalEmailPayloadDto.Customer.builder()
+                .firstName(emailPlaceholderDto.getAccountUser().getFirstName())
+                .lastName(emailPlaceholderDto.getAccountUser().getLastName())
+                .build())
+        .account(
+            AnnualRenewalEmailPayloadDto.Account.builder()
+                .accountNumber(emailPlaceholderDto.getAccountNumber())
+                .build())
+        .contact(
+            AnnualRenewalEmailPayloadDto.Contact.builder()
+                .phoneNumber(emailPlaceholderDto.getPhoneNumber())
+                .build())
+        .renewalDetails(
+            AnnualRenewalEmailPayloadDto.RenewalDetails.builder()
+                .renewalDate(formattedRenewalDate)
+                .renewalAmount(formattedRenewalAmount)
+                .build())
+        .build();
+  }
+
+  private String serializeEmailContentToXml(AnnualRenewalEmailPayloadDto contentData)
+      throws Exception {
+    try (StringWriter writer = new StringWriter()) {
+      xmlMapper.writeValue(writer, contentData);
+      return writer.toString();
+    }
+  }
+
+  private EmailApiRequestDto mapEmailPlaceholderToEmailApiRequest(
+      AnnualRenewalPlaceholderDto emailPlaceholderDto, String xmlContent) {
+    EmailEntryData emailPayload =
+        mapEmailPlaceholderToEmailEntryData(emailPlaceholderDto, xmlContent);
+
+    return EmailApiRequestDto.builder()
+        .emailApiVersion(EmailConstants.EMAIL_API_VERSION)
+        .emailEntryData(emailPayload)
+        .build();
+  }
+
+  private EmailEntryData mapEmailPlaceholderToEmailEntryData(
+      AnnualRenewalPlaceholderDto emailPlaceholderDto, String xmlContent) {
+    return EmailEntryData.builder()
+        .toAddress(emailPlaceholderDto.getAccountUser().getEmailAddress())
+        .xmlData(xmlContent)
+        .vgMailingName(defaultVgMailingName)
+        .partnerId(emailPlaceholderDto.getPartnerId())
+        .createUser(apiCreateUser)
+        .createProgram(apiCreateProgram)
+        .build();
+  }
+
+  private EmailApiResponseDto makeEmailApiRequest(String requestBody) {
+    String gmtDateForHeader = generateGmtDateHeader();
+    String signature =
+        PiSignature.generateAuthenticationSignature(
+            EmailConstants.HTTP_METHOD_POST,
+            emailApiEndpoint,
+            gmtDateForHeader,
+            requestBody,
+            hmacSecretKey);
+    URI unifiedEmailApiUrl = createEmailApiUri();
+
+    EmailApiResponseDto apiResponse =
+        restClient
+            .post()
+            .uri(unifiedEmailApiUrl)
+            .contentType(MediaType.APPLICATION_JSON)
+            .header(EmailConstants.AUTHORIZATION_HEADER, "PI " + emailApiKey + ":" + signature)
+            .header(EmailConstants.X_VON_DATE_HEADER, gmtDateForHeader)
+            .body(requestBody)
+            .retrieve()
+            .body(EmailApiResponseDto.class);
+
+    if (apiResponse.getEmailFeedback() != null
+        && !EmailConstants.EMAIL_API_SUCCESS_STATUS.equals(
+        apiResponse.getEmailFeedback().getStatus())) {
+      log.error(
+          "Email API call failed with status: {} and response: {}",
+          apiResponse.getEmailFeedback().getStatus(),
+          apiResponse);
+      throw new EmailApiException("Email API failed: " + apiResponse);
+    }
+
+    return apiResponse;
+  }
+
+  private String generateGmtDateHeader() {
+    return ZonedDateTime.now(ZoneOffset.UTC)
+        .format(
+            DateTimeFormatter.ofPattern(EmailConstants.DATE_FORMAT_YYYY_MM_DD_HH_MM_SS_GMT)
+                .withZone(ZoneOffset.UTC));
+  }
+
+  private URI createEmailApiUri() {
+    return URI.create(emailApiBaseUrl).resolve(emailApiEndpoint);
+  }
+
+  private Long extractQueueIdFromApiResponse(EmailApiResponseDto apiResponse) {
+    if (apiResponse.getEmailFeedback() == null) {
+      return null;
+    }
+    try {
+      return Long.valueOf(apiResponse.getEmailFeedback().getMessage());
+    } catch (NumberFormatException e) {
+      return null;
+    }
+  }
+}
+
