@@ -1,0 +1,59 @@
+@ExtendWith(MockitoExtension.class)
+class YourServiceImplTest {
+
+    // --------------------- Constants ---------------------
+    private static final Long DEFAULT_ID = 100L;
+    
+    // --------------------- Dependencies ---------------------
+    private YourServiceImpl serviceUnderTest;
+    @Mock private Repository repository;
+    @Mock private ExternalService externalService;
+    
+    // --------------------- Static Factory Methods ---------------------
+    private static Entity createEntity(Long id) {
+        Entity entity = new Entity();
+        entity.setId(id);
+        return entity;
+    }
+    
+    // --------------------- Lifecycle ---------------------
+    @BeforeEach
+    void setUp() {
+        serviceUnderTest = new YourServiceImpl(repository, externalService);
+    }
+    
+    @AfterEach
+    void resetMocks() {
+        Mockito.reset(repository, externalService);
+    }
+    
+    // --------------------- Nested Test Classes ---------------------
+    @Nested
+    class FeatureOrScenarioName {
+        
+        @BeforeEach
+        void prepareScenario() {
+            // Scenario-specific setup
+        }
+        
+        @Test
+        void describesWhatThisTestValidates() {
+            // Arrange
+            // Act
+            // Assert
+        }
+        
+        @ParameterizedTest
+        @MethodSource("scenarioInputs")
+        void validatesMultipleInputs(InputType input, ExpectedType expected) {
+            // Arrange, Act, Assert
+        }
+        
+        private static Stream<Arguments> scenarioInputs() {
+            return Stream.of(
+                Arguments.of(input1, expected1),
+                Arguments.of(input2, expected2)
+            );
+        }
+    }
+}
