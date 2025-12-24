@@ -1,0 +1,116 @@
+package com.vonage.resischeduler.scheduler;
+
+import com.vonage.resischeduler.config.job.JobConfig;
+import com.vonage.resischeduler.entity.job.JobInstance;
+import com.vonage.resischeduler.enums.RepeatType;
+import com.vonage.resischeduler.jobtype.PeriodicQueueProcessingJob;
+import jakarta.annotation.PostConstruct;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.TaskScheduler;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
+import org.springframework.scheduling.support.CronTrigger;
+import org.springframework.stereotype.Component;
+
+@Slf4j
+@Component
+@EnableScheduling
+@RequiredArgsConstructor
+public class ConfigJobScheduler {
+
+  private final JobConfig jobConfigurationProperties;
+  private final List<PeriodicQueueProcessingJob> availableJobs;
+
+  private final ConcurrentHashMap<Long, ScheduledFuture<?>> runningWorkers =
+      new ConcurrentHashMap<>();
+  private TaskScheduler taskScheduler;
+
+  @PostConstruct
+  public void init() {
+    ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+    scheduler.setPoolSize(10);
+    scheduler.setThreadNamePrefix("ConfigJobScheduler-");
+    scheduler.initialize();
+    this.taskScheduler = scheduler;
+
+    scheduleConfiguredJobs();
+  }
+
+  private void scheduleConfiguredJobs() {
+    for (JobConfig jobConfig : jobConfigurationProperties.getJobs()) {
+      if (!jobConfig.isEnabled()) {
+        log.info("Skipping disabled job: {}", jobConfig.getName());
+        continue;
+      }
+
+      PeriodicQueueProcessingJob jobBean = resolveJobBean(jobConfig.getClassName());
+      if (jobBean == null) {
+        log.error("Job class {} not found as a Spring bean", jobConfig.getClassName());
+        continue;
+      }
+
+      // Schedule CRON job to create JobInstances
+      taskScheduler.schedule(() -> {
+        JobInstance jobInstance = jobBean.initJobInstance(jobConfig);
+        if (!jobConfig.getInstance().getRepeatType().equals(RepeatType.ONE_TIME)) {
+          scheduleWorker(jobBean, jobInstance.getId(), jobConfig);
+        }
+      }, new CronTrigger(jobConfig.getCron()));
+
+      log.info("Scheduled job {} with cron {}", jobConfig.getName(), jobConfig.getCron());
+    }
+  }
+
+  /**
+   * Schedules a worker for the given JobInstance.
+   */
+  private void scheduleWorker(PeriodicQueueProcessingJob jobBean, Long jobInstanceId,
+                              JobConfig jobConfig) {
+    Runnable workerTask = () -> {
+      try {
+        jobBean.runJobInstance(jobInstanceId, jobConfig);
+
+        // Stop scheduling if job has completed
+        JobInstance instance =
+            jobBean.getJobInstanceRepository().findById(jobInstanceId).orElse(null);
+        if (instance == null || instance.isTerminal()) {
+          stopWorker(jobInstanceId);
+        }
+      } catch (Exception e) {
+        log.error("Error in worker execution for jobInstance {}", jobInstanceId, e);
+      }
+    };
+
+    ScheduledFuture<?> future = ((ThreadPoolTaskScheduler) taskScheduler)
+        .scheduleAtFixedRate(workerTask,
+            jobConfig.getInstance().getRepeatIntervalSeconds() * 1000L);
+
+    runningWorkers.put(jobInstanceId, future);
+
+    log.info("Worker scheduled for jobInstance {} every {}s",
+        jobInstanceId, jobConfig.getInstance().getRepeatIntervalSeconds());
+  }
+
+  /**
+   * Stops the worker once the jobInstance is completed/failed.
+   */
+  private void stopWorker(Long jobInstanceId) {
+    ScheduledFuture<?> future = runningWorkers.remove(jobInstanceId);
+    if (future != null) {
+      future.cancel(false);
+      log.info("Stopped worker for jobInstance {}", jobInstanceId);
+    }
+  }
+
+  private PeriodicQueueProcessingJob resolveJobBean(String className) {
+    return availableJobs.stream()
+        .filter(job -> job.getClass().getName().equals(className))
+        .findFirst()
+        .orElse(null);
+  }
+}
+

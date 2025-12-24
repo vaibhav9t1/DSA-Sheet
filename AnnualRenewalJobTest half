@@ -1,0 +1,558 @@
+package com.vonage.resischeduler.jobs.annualrenewal;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.vonage.resischeduler.framework.config.job.JobConfig;
+import com.vonage.resischeduler.framework.config.job.PeriodicQueueProcessingJobTypeConfig;
+import com.vonage.resischeduler.framework.core.enums.JobType;
+import com.vonage.resischeduler.framework.core.exception.JobExecutionException;
+import com.vonage.resischeduler.framework.jobtype.enums.JobInstanceStatus;
+import com.vonage.resischeduler.framework.jobtype.enums.QueueRecordStatus;
+import com.vonage.resischeduler.framework.jobtype.mapper.PeriodicQueueProcessingJobMapper;
+import com.vonage.resischeduler.framework.persistence.entity.JobInstanceEntity;
+import com.vonage.resischeduler.framework.persistence.entity.QueueRecordEntity;
+import com.vonage.resischeduler.framework.persistence.repository.JobInstanceRepository;
+import com.vonage.resischeduler.framework.persistence.repository.QueueRecordRepository;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.AnnualRenewalJobContextDataDto;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.AnnualRenewalQueueRecordContextDto;
+import com.vonage.resischeduler.jobs.annualrenewal.dto.email.AnnualRenewalEmailPayloadDto;
+import com.vonage.resischeduler.jobs.annualrenewal.mapper.AnnualRenewalMapper;
+import com.vonage.resischeduler.shared.billing.entity.RatePromoEntity;
+import com.vonage.resischeduler.shared.billing.repository.RatePromoRepository;
+import com.vonage.resischeduler.shared.client.email.EmailServiceClient;
+import com.vonage.resischeduler.shared.client.email.exception.EmailPlaceholderDataNotFoundException;
+import com.vonage.resischeduler.shared.uad.entity.SaveTerminateTaskEntity;
+import com.vonage.resischeduler.shared.uad.repository.SaveTerminateTaskRepository;
+import com.vonage.resischeduler.shared.vdv.entity.AccountEntity;
+import com.vonage.resischeduler.shared.vdv.entity.AccountUserAddressEntity;
+import com.vonage.resischeduler.shared.vdv.entity.AccountUserEntity;
+import com.vonage.resischeduler.shared.vdv.entity.DidBillingItemEntity;
+import com.vonage.resischeduler.shared.vdv.entity.DidNumberEntity;
+import com.vonage.resischeduler.shared.vdv.repository.AccountRepository;
+import com.vonage.resischeduler.shared.vdv.repository.AccountUserAddressRepository;
+import com.vonage.resischeduler.shared.vdv.repository.AccountUserRepository;
+import com.vonage.resischeduler.shared.vdv.repository.DidBillingItemRepository;
+import com.vonage.resischeduler.shared.vdv.repository.DidNumberRepository;
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.transaction.support.TransactionCallback;
+import org.springframework.transaction.support.TransactionTemplate;
+
+/**
+ * Tests the complete Annual Renewal business flow including both framework (PeriodicQueueProcessingJobType)
+ * and job-specific (AnnualRenewalJob) behavior. Tests are organized by business use cases, not individual methods.
+ */
+@ExtendWith(MockitoExtension.class)
+class AnnualRenewalJobTest {
+
+  // --------------------- Constants ---------------------
+  private static final String JOB_NAME = "AnnualRenewal";
+  private static final JobType JOB_TYPE = JobType.PERIODIC_QUEUE_PROCESSING_JOB;
+  private static final int LOOKBACK_DAYS = 2;
+  private static final int BATCH_SIZE = 50;
+  private static final int MAX_RETRIES = 3;
+  private static final List<Integer> NOTIF_DAYS = List.of(15, 30);
+  private static final String DEFAULT_ITEM_CODE = "USVONPREPAID_RESPRM";
+  private static final String VG_MAILING_NAME = "Account_Renewal_Notification_USCAUK";
+  private static final Long DEFAULT_JOB_INSTANCE_ID = 1001L;
+  private static final Long DEFAULT_ACCOUNT_NUMBER = 2000L;
+  private static final Long BASE_ACCOUNT_NUMBER = 3000L;
+  private static final Long DEFAULT_DID_NUMBER_ID = 4000L;
+  private static final Long DEFAULT_EMAIL_QUEUE_ID = 5000L;
+  private static final String DEFAULT_EMAIL = "test@vonage.com";
+  private static final String DEFAULT_PHONE_NUMBER = "1234567890";
+  private static final String DEFAULT_PARTNER_ID = "VONAGE";
+  private static final String DEFAULT_STATE = "CA";
+  private static final BigDecimal DEFAULT_PRICE = new BigDecimal("29.99");
+  private static final LocalDate TODAY = LocalDate.now();
+  private static final int TOTAL_BILLING_ITEMS = 50;
+  private static final int EXPIRED_ITEM_COUNT = 10;
+  private static final Set<Long> DISCONNECT_ACCOUNTS =
+      Set.of(BASE_ACCOUNT_NUMBER + 11, BASE_ACCOUNT_NUMBER + 15, BASE_ACCOUNT_NUMBER + 22);
+
+  // --------------------- Dependencies ---------------------
+  private AnnualRenewalJob annualRenewalJob;
+
+  // Framework dependencies (from PeriodicQueueProcessingJobType)
+  @Mock private JobInstanceRepository jobInstanceRepository;
+  @Mock private QueueRecordRepository queueRecordRepository;
+  @Mock private PeriodicQueueProcessingJobMapper<AnnualRenewalJobContextDataDto,
+      AnnualRenewalQueueRecordContextDto> periodicQueueProcessingJobMapper;
+  @Mock private TransactionTemplate transactionTemplate;
+
+  // Job-specific dependencies (AnnualRenewalJob)
+  @Mock private RatePromoRepository ratePromoRepository;
+  @Mock private DidBillingItemRepository didBillingItemRepository;
+  @Mock private SaveTerminateTaskRepository saveTerminateTaskRepository;
+  @Mock private AccountRepository accountRepository;
+  @Mock private AccountUserRepository accountUserRepository;
+  @Mock private DidNumberRepository didNumberRepository;
+  @Mock private AccountUserAddressRepository accountUserAddressRepository;
+  @Mock private EmailServiceClient emailServiceClient;
+  @Mock private AnnualRenewalMapper annualRenewalMapper;
+
+  // --------------------- Factory Methods ---------------------
+  private static JobConfig createJobConfig(boolean enableJobInstanceIdempotency,
+      boolean enableQueueRecordIdempotency) {
+    JobConfig config = new JobConfig();
+    config.setName(JOB_NAME);
+    config.setType(JOB_TYPE);
+    config.setEnableJobInstanceIdempotency(enableJobInstanceIdempotency);
+
+    PeriodicQueueProcessingJobTypeConfig periodicConfig =
+        new PeriodicQueueProcessingJobTypeConfig();
+    periodicConfig.setBatchSize(BATCH_SIZE);
+    periodicConfig.setMaxRetries(MAX_RETRIES);
+    periodicConfig.setRepeatIntervalSeconds(7200);
+    periodicConfig.setEnableQueueRecordIdempotency(enableQueueRecordIdempotency);
+    config.setPeriodicQueueProcessingJobTypeConfig(periodicConfig);
+
+    Map<String, Object> contextData = new HashMap<>();
+    contextData.put("notif-days", NOTIF_DAYS);
+    contextData.put("lookback-days", LOOKBACK_DAYS);
+    contextData.put("email-api-vg-mailing-name", VG_MAILING_NAME);
+    config.setContextData(contextData);
+
+    return config;
+  }
+
+  private static JobInstanceEntity createJobInstance(Long id, JobInstanceStatus status,
+      LocalDateTime createDate) {
+    JobInstanceEntity entity = new JobInstanceEntity();
+    entity.setId(id);
+    entity.setJobName(JOB_NAME);
+    entity.setJobType(JOB_TYPE);
+    entity.setStatus(status);
+    entity.setBusinessIdentifier(JOB_NAME + "||" + TODAY);
+    entity.setCreateDate(createDate);
+    entity.setContextData(new HashMap<>());
+    return entity;
+  }
+
+  private static DidBillingItemEntity createBillingItem(Long accountNumber, LocalDate dateStart,
+      LocalDate dateEnd) {
+    DidBillingItemEntity entity = new DidBillingItemEntity();
+    entity.setAccountNumber(accountNumber);
+    entity.setDidNumberId(DEFAULT_DID_NUMBER_ID);
+    entity.setServiceItemCode(DEFAULT_ITEM_CODE);
+    entity.setDateStart(dateStart);
+    entity.setDateEnd(dateEnd);
+    entity.setSequenceId(1000L);
+    return entity;
+  }
+
+  private static List<DidBillingItemEntity> buildBillingItemsWithExpiredAndActive() {
+    List<DidBillingItemEntity> dataset = new ArrayList<>();
+    for (int i = 0; i < TOTAL_BILLING_ITEMS; i++) {
+      long accountNumber = BASE_ACCOUNT_NUMBER + i;
+      if (i < EXPIRED_ITEM_COUNT) {
+        dataset.add(createBillingItem(accountNumber, TODAY.minusYears(1), TODAY.minusDays(i + 1)));
+      } else {
+        dataset.add(createBillingItem(accountNumber, TODAY.minusYears(1), null));
+      }
+    }
+    return dataset;
+  }
+
+  private static QueueRecordEntity createQueueRecord(Long id, QueueRecordStatus status,
+      int retryCount, Long accountNumber) {
+    QueueRecordEntity entity = new QueueRecordEntity();
+    entity.setId(id);
+    entity.setJobInstanceId(DEFAULT_JOB_INSTANCE_ID);
+    entity.setBusinessIdentifier("account-" + accountNumber);
+    entity.setStatus(status);
+    entity.setRetryCount(retryCount);
+
+    Map<String, Object> contextData = new HashMap<>();
+    contextData.put("accountNumber", accountNumber);
+    contextData.put("didNumberId", DEFAULT_DID_NUMBER_ID);
+    contextData.put("itemCode", DEFAULT_ITEM_CODE);
+    contextData.put("renewalDate", TODAY.plusDays(30).toString());
+    entity.setContextData(contextData);
+    entity.setResultContextData(new HashMap<>());
+    return entity;
+  }
+
+  private static RatePromoEntity createRatePromo(String itemCode) {
+    RatePromoEntity entity = new RatePromoEntity();
+    entity.setItemCode(itemCode);
+    entity.setPrice(DEFAULT_PRICE);
+    return entity;
+  }
+
+  // --------------------- Lifecycle ---------------------
+  @BeforeEach
+  void setUpServiceAndDependencies() {
+    initializeServiceUnderTest();
+    setupTransactionTemplateStub();
+    setupPeriodicQueueProcessingJobMapperStubs();
+  }
+
+  @AfterEach
+  void resetMocksAfterEachTest() {
+    Mockito.reset(
+        jobInstanceRepository, queueRecordRepository, periodicQueueProcessingJobMapper,
+        transactionTemplate, ratePromoRepository, didBillingItemRepository,
+        saveTerminateTaskRepository, accountRepository, accountUserRepository,
+        didNumberRepository, accountUserAddressRepository, emailServiceClient,
+        annualRenewalMapper);
+  }
+
+  // --------------------- Helper Methods ---------------------
+  private void initializeServiceUnderTest() {
+    annualRenewalJob = new AnnualRenewalJob(
+        ratePromoRepository, didBillingItemRepository, saveTerminateTaskRepository,
+        accountRepository, accountUserRepository, didNumberRepository,
+        accountUserAddressRepository, jobInstanceRepository, emailServiceClient,
+        annualRenewalMapper);
+
+    // Inject framework dependencies
+    annualRenewalJob.jobInstanceRepository = jobInstanceRepository;
+    annualRenewalJob.queueRecordRepository = queueRecordRepository;
+    annualRenewalJob.periodicQueueProcessingJobMapper = periodicQueueProcessingJobMapper;
+    annualRenewalJob.transactionTemplate = transactionTemplate;
+  }
+
+  private void setupTransactionTemplateStub() {
+    when(transactionTemplate.execute(any())).thenAnswer(invocation -> {
+      @SuppressWarnings("unchecked")
+      TransactionCallback<Object> callback = invocation.getArgument(0);
+      return callback.doInTransaction(null);
+    });
+  }
+
+  private void setupPeriodicQueueProcessingJobMapperStubs() {
+    AnnualRenewalJobContextDataDto contextDto = new AnnualRenewalJobContextDataDto();
+    contextDto.setLookBackDays(LOOKBACK_DAYS);
+    contextDto.setNotifDays(NOTIF_DAYS);
+    contextDto.setVgMailingName(VG_MAILING_NAME);
+    contextDto.setReminderCalStartDate(TODAY);
+    contextDto.setReminderCalEndDate(TODAY);
+
+    when(periodicQueueProcessingJobMapper.mapToJobInstContextData(any(), any()))
+        .thenReturn(contextDto);
+    when(periodicQueueProcessingJobMapper.mapJobInstContextDataToMap(any()))
+        .thenReturn(new HashMap<>());
+    when(periodicQueueProcessingJobMapper.mapToJobInstanceEntity(
+        anyString(), any(), any(), any(), any()))
+        .thenAnswer(inv -> {
+          JobInstanceEntity entity = createJobInstance(DEFAULT_JOB_INSTANCE_ID,
+              JobInstanceStatus.PENDING, LocalDateTime.now());
+          entity.setBusinessIdentifier(inv.getArgument(0));
+          entity.setStatus(inv.getArgument(1));
+          return entity;
+        });
+    when(periodicQueueProcessingJobMapper.mapToQueueRecordEntities(any(), anyLong(), any(), any()))
+        .thenAnswer(inv -> {
+          List<?> payloads = inv.getArgument(0);
+          return payloads.stream()
+              .map(p -> createQueueRecord(1L, QueueRecordStatus.PENDING, 0, DEFAULT_ACCOUNT_NUMBER))
+              .toList();
+        });
+
+    AnnualRenewalQueueRecordContextDto queueContextDto = new AnnualRenewalQueueRecordContextDto();
+    queueContextDto.setAccountNumber(DEFAULT_ACCOUNT_NUMBER);
+    queueContextDto.setDidNumberId(DEFAULT_DID_NUMBER_ID);
+    queueContextDto.setItemCode(DEFAULT_ITEM_CODE);
+    queueContextDto.setRenewalDate(TODAY.plusDays(30));
+    when(periodicQueueProcessingJobMapper.mapToQueueRecordContextData(any(), any()))
+        .thenReturn(queueContextDto);
+  }
+
+  private void setupSuccessfulEmailDispatchMocks() {
+    AccountUserEntity accountUser = new AccountUserEntity();
+    accountUser.setEmailAddress(DEFAULT_EMAIL);
+    accountUser.setFirstName("John");
+    accountUser.setLastName("Doe");
+
+    when(accountUserRepository.findUserNameAndEmailAddressByAccountNumber(any()))
+        .thenReturn(Optional.of(accountUser));
+    when(didNumberRepository.findPhoneNumberByDidNumberId(any()))
+        .thenReturn(Optional.of(new DidNumberEntity(DEFAULT_DID_NUMBER_ID, DEFAULT_PHONE_NUMBER)));
+    when(ratePromoRepository.findPlanPriceByItemCode(any()))
+        .thenReturn(Optional.of(createRatePromo(DEFAULT_ITEM_CODE)));
+    when(accountRepository.findPartnerIdByAccountNumber(any()))
+        .thenReturn(Optional.of(new AccountEntity(DEFAULT_ACCOUNT_NUMBER, "A", DEFAULT_PARTNER_ID)));
+    when(accountUserAddressRepository.findStateProvinceByAccountNumber(any()))
+        .thenReturn(Optional.of(new AccountUserAddressEntity(DEFAULT_ACCOUNT_NUMBER, DEFAULT_STATE)));
+    when(annualRenewalMapper.mapEmailPlaceholderToPayloadDto(any()))
+        .thenReturn(mock(AnnualRenewalEmailPayloadDto.class));
+    when(emailServiceClient.sendEmail(any(), anyString(), anyString(), anyString()))
+        .thenReturn(DEFAULT_EMAIL_QUEUE_ID);
+  }
+
+  // --------------------- BUSINESS USE CASE TESTS ---------------------
+
+  @Nested
+  class CompleteJobLifecycleExecution {
+
+    /**
+     * BUSINESS USE CASE: Schedule annual renewal job, initialize job instance,
+     * fetch eligible billing items, persist queue records, and transition to IN_PROGRESS.
+     */
+    @Test
+    void createsNewJobInstanceAndQueuesEligibleRenewalReminders() {
+      JobConfig jobConfig = createJobConfig(false, false);
+
+      // Setup: No previous job exists
+      when(jobInstanceRepository.findTopByJobNameOrderByCreateDateDesc(JOB_NAME))
+          .thenReturn(Optional.empty());
+      when(jobInstanceRepository.save(any())).thenAnswer(inv -> {
+        JobInstanceEntity entity = inv.getArgument(0);
+        entity.setId(DEFAULT_JOB_INSTANCE_ID);
+        return entity;
+      });
+
+      // Setup: Eligible billing items exist
+      when(ratePromoRepository.findEligibleAnnualPlans())
+          .thenReturn(List.of(createRatePromo(DEFAULT_ITEM_CODE)));
+      when(didBillingItemRepository.findByItemCodeInAndRenewalDateWithinReminderPeriod(
+          anyList(), eq(NOTIF_DAYS), any()))
+          .thenReturn(List.of(createBillingItem(DEFAULT_ACCOUNT_NUMBER, TODAY.minusYears(1), null)));
+      when(saveTerminateTaskRepository.findByAcctNbrAndTaskStatusCdInAndTaskTypeCd(any(), any(), any()))
+          .thenReturn(Collections.emptyList());
+      when(annualRenewalMapper.mapToQueueRecordPayloadDto(any(), any(), any()))
+          .thenReturn(mock());
+
+      // EXECUTE: Create job instance
+      Optional<JobInstanceEntity> jobInstanceOpt = annualRenewalJob.initJobInstance(jobConfig);
+
+      // VERIFY: Job instance created
+      assertThat(jobInstanceOpt).isPresent();
+      JobInstanceEntity jobInstance = jobInstanceOpt.get();
+      assertThat(jobInstance.getStatus()).isEqualTo(JobInstanceStatus.PENDING);
+      assertThat(jobInstance.getBusinessIdentifier()).contains(JOB_NAME);
+      verify(jobInstanceRepository).save(any(JobInstanceEntity.class));
+
+      // EXECUTE: Run job instance (PENDING → IN_PROGRESS with queue records)
+      annualRenewalJob.runJobInstance(jobInstance, jobConfig);
+
+      // VERIFY: Queue records persisted and job transitioned to IN_PROGRESS
+      verify(queueRecordRepository).saveAll(anyList());
+      ArgumentCaptor<JobInstanceEntity> entityCaptor = ArgumentCaptor.forClass(JobInstanceEntity.class);
+      verify(jobInstanceRepository, times(2)).save(entityCaptor.capture());
+      assertThat(entityCaptor.getValue().getStatus()).isEqualTo(JobInstanceStatus.IN_PROGRESS);
+    }
+
+    /**
+     * BUSINESS USE CASE: Job instance idempotency - skip creating duplicate job
+     * when same business identifier already exists.
+     */
+    @Test
+    void skipsJobCreationWhenIdempotencyEnabledAndDuplicateExists() {
+      JobConfig jobConfig = createJobConfig(true, false);
+
+      JobInstanceEntity existingJob = createJobInstance(DEFAULT_JOB_INSTANCE_ID,
+          JobInstanceStatus.PENDING, LocalDateTime.now());
+      when(jobInstanceRepository.findByJobNameAndBusinessIdentifier(anyString(), anyString()))
+          .thenReturn(List.of(existingJob));
+
+      Optional<JobInstanceEntity> result = annualRenewalJob.initJobInstance(jobConfig);
+
+      assertThat(result).isEmpty();
+      verify(jobInstanceRepository, never()).save(any());
+    }
+
+    /**
+     * BUSINESS USE CASE: Process IN_PROGRESS job - fetch pending queue records in batch,
+     * send renewal emails, mark records as SUCCESS, and transition job to SUCCESS when done.
+     */
+    @Test
+    void processesPendingQueueRecordsAndTransitionsToSuccessWhenComplete() {
+      JobConfig jobConfig = createJobConfig(false, false);
+      JobInstanceEntity jobInstance = createJobInstance(DEFAULT_JOB_INSTANCE_ID,
+          JobInstanceStatus.IN_PROGRESS, LocalDateTime.now());
+
+      // Setup: 3 pending queue records
+      List<QueueRecordEntity> pendingRecords = List.of(
+          createQueueRecord(1L, QueueRecordStatus.PENDING, 0, BASE_ACCOUNT_NUMBER),
+          createQueueRecord(2L, QueueRecordStatus.PENDING, 0, BASE_ACCOUNT_NUMBER + 1),
+          createQueueRecord(3L, QueueRecordStatus.PENDING, 0, BASE_ACCOUNT_NUMBER + 2)
+      );
+      when(queueRecordRepository.findByJobInstanceIdAndStatus(
+          eq(DEFAULT_JOB_INSTANCE_ID), eq(QueueRecordStatus.PENDING), any(PageRequest.class)))
+          .thenReturn(pendingRecords).thenReturn(Collections.emptyList());
+
+      setupSuccessfulEmailDispatchMocks();
+      when(jobInstanceRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+      // EXECUTE: First cycle - process 3 records
+      annualRenewalJob.runJobInstance(jobInstance, jobConfig);
+
+      // VERIFY: All 3 emails sent and records marked SUCCESS
+      verify(emailServiceClient, times(3)).sendEmail(any(), anyString(), anyString(), anyString());
+      ArgumentCaptor<QueueRecordEntity> recordCaptor = ArgumentCaptor.forClass(QueueRecordEntity.class);
+      verify(queueRecordRepository, times(3)).save(recordCaptor.capture());
+      recordCaptor.getAllValues().forEach(record ->
+          assertThat(record.getStatus()).isEqualTo(QueueRecordStatus.SUCCESS)
+      );
+
+      // EXECUTE: Second cycle - no pending records, should transition to SUCCESS
+      annualRenewalJob.runJobInstance(jobInstance, jobConfig);
+
+      // VERIFY: Job transitioned to SUCCESS
+      ArgumentCaptor<JobInstanceEntity> entityCaptor = ArgumentCaptor.forClass(JobInstanceEntity.class);
+      verify(jobInstanceRepository, times(2)).save(entityCaptor.capture());
+      assertThat(entityCaptor.getValue().getStatus()).isEqualTo(JobInstanceStatus.SUCCESS);
+    }
+  }
+
+  @Nested
+  class EligibleBillingItemsFiltering {
+
+    /**
+     * BUSINESS USE CASE: Filter out billing items with expired plans - don't send
+     * renewal reminders for accounts whose billing plan already ended.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {1, 5, 10})
+    void filtersExpiredBillingItemsFromEligibleRecords(int expiredCount) {
+      JobConfig jobConfig = createJobConfig(false, false);
+
+      List<DidBillingItemEntity> mixedItems = new ArrayList<>();
+      for (int i = 0; i < expiredCount; i++) {
+        mixedItems.add(createBillingItem(BASE_ACCOUNT_NUMBER + i, TODAY.minusYears(1),
+            TODAY.minusDays(1)));
+      }
+      mixedItems.add(createBillingItem(BASE_ACCOUNT_NUMBER + 100, TODAY.minusYears(1), null));
+
+      when(jobInstanceRepository.findTopByJobNameOrderByCreateDateDesc(JOB_NAME))
+          .thenReturn(Optional.empty());
+      when(jobInstanceRepository.save(any())).thenAnswer(inv -> {
+        JobInstanceEntity entity = inv.getArgument(0);
+        entity.setId(DEFAULT_JOB_INSTANCE_ID);
+        return entity;
+      });
+      when(ratePromoRepository.findEligibleAnnualPlans())
+          .thenReturn(List.of(createRatePromo(DEFAULT_ITEM_CODE)));
+      when(didBillingItemRepository.findByItemCodeInAndRenewalDateWithinReminderPeriod(
+          anyList(), eq(NOTIF_DAYS), any()))
+          .thenReturn(mixedItems);
+      when(saveTerminateTaskRepository.findByAcctNbrAndTaskStatusCdInAndTaskTypeCd(any(), any(), any()))
+          .thenReturn(Collections.emptyList());
+      when(annualRenewalMapper.mapToQueueRecordPayloadDto(any(), any(), any()))
+          .thenReturn(mock());
+
+      Optional<JobInstanceEntity> jobInstanceOpt = annualRenewalJob.initJobInstance(jobConfig);
+      annualRenewalJob.runJobInstance(jobInstanceOpt.get(), jobConfig);
+
+      // VERIFY: Only 1 queue record created (expired items filtered out)
+      ArgumentCaptor<List<QueueRecordEntity>> listCaptor = ArgumentCaptor.forClass(List.class);
+      verify(queueRecordRepository).saveAll(listCaptor.capture());
+      assertThat(listCaptor.getValue()).hasSize(1);
+    }
+
+    /**
+     * BUSINESS USE CASE: Filter out accounts scheduled for disconnect - don't send
+     * renewal reminders to accounts that are already marked for termination.
+     */
+    @Test
+    void filtersAccountsScheduledForDisconnectFromEligibleRecords() {
+      JobConfig jobConfig = createJobConfig(false, false);
+
+      List<DidBillingItemEntity> billingItems = buildBillingItemsWithExpiredAndActive();
+
+      when(jobInstanceRepository.findTopByJobNameOrderByCreateDateDesc(JOB_NAME))
+          .thenReturn(Optional.empty());
+      when(jobInstanceRepository.save(any())).thenAnswer(inv -> {
+        JobInstanceEntity entity = inv.getArgument(0);
+        entity.setId(DEFAULT_JOB_INSTANCE_ID);
+        return entity;
+      });
+      when(ratePromoRepository.findEligibleAnnualPlans())
+          .thenReturn(List.of(createRatePromo(DEFAULT_ITEM_CODE)));
+      when(didBillingItemRepository.findByItemCodeInAndRenewalDateWithinReminderPeriod(
+          anyList(), eq(NOTIF_DAYS), any()))
+          .thenReturn(billingItems);
+      when(saveTerminateTaskRepository.findByAcctNbrAndTaskStatusCdInAndTaskTypeCd(
+          anyLong(), anyList(), anyString()))
+          .thenAnswer(invocation -> {
+            Long acctNbr = invocation.getArgument(0);
+            return DISCONNECT_ACCOUNTS.contains(acctNbr)
+                ? List.of(mock(SaveTerminateTaskEntity.class))
+                : Collections.emptyList();
+          });
+      when(annualRenewalMapper.mapToQueueRecordPayloadDto(any(), any(), any()))
+          .thenReturn(mock());
+
+      Optional<JobInstanceEntity> jobInstanceOpt = annualRenewalJob.initJobInstance(jobConfig);
+      annualRenewalJob.runJobInstance(jobInstanceOpt.get(), jobConfig);
+
+      // VERIFY: Expired items + disconnect accounts filtered out
+      int expectedRecords = TOTAL_BILLING_ITEMS - EXPIRED_ITEM_COUNT - DISCONNECT_ACCOUNTS.size();
+      ArgumentCaptor<List<QueueRecordEntity>> listCaptor = ArgumentCaptor.forClass(List.class);
+      verify(queueRecordRepository).saveAll(listCaptor.capture());
+      assertThat(listCaptor.getValue()).hasSize(expectedRecords);
+    }
+
+    /**
+     * BUSINESS USE CASE: Skip job execution when no eligible annual plans exist.
+     */
+    @Test
+    void skipsQueueRecordCreationWhenNoEligiblePlansExist() {
+      JobConfig jobConfig = createJobConfig(false, false);
+
+      when(jobInstanceRepository.findTopByJobNameOrderByCreateDateDesc(JOB_NAME))
+          .thenReturn(Optional.empty());
+      when(jobInstanceRepository.save(any())).thenAnswer(inv -> {
+        JobInstanceEntity entity = inv.getArgument(0);
+        entity.setId(DEFAULT_JOB_INSTANCE_ID);
+        return entity;
+      });
+      when(ratePromoRepository.findEligibleAnnualPlans()).thenReturn(Collections.emptyList());
+
+      Optional<JobInstanceEntity> jobInstanceOpt = annualRenewalJob.initJobInstance(jobConfig);
+      annualRenewalJob.runJobInstance(jobInstanceOpt.get(), jobConfig);
+
+      verify(didBillingItemRepository, never())
+          .findByItemCodeInAndRenewalDateWithinReminderPeriod(any(), any(), any());
+      verify(queueRecordRepository, never()).saveAll(anyList());
+    }
+  }
+
+  @Nested
+  class EmailDispatchAndRetryLogic {
+
+    /**
+     * BUSINESS USE CASE: Send renewal reminder emails successfully and mark queue
+     * records as SUCCESS with email queue ID in result context.
+     */
+    @Test
+    void successfullyDispatchesRenewalReminderEmailsAndMarksRecordsSuccess() {
+      JobConfig jobConfig = createJobConfig(false, false);
+      JobInstanceEntity jobInstance = createJobInstance(DEFAULT_JOB_INSTANCE_ID,
+          JobInstanceStatus.
